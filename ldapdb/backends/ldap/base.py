@@ -4,7 +4,10 @@
 
 from __future__ import unicode_literals
 
-import ldap
+try:
+    import videobank.core.gldap as ldap
+except:
+    import ldap
 import django
 
 if django.VERSION < (1, 8):
@@ -17,6 +20,9 @@ else:
     from django.db.backends.base.base import BaseDatabaseWrapper
     from django.db.backends.base.creation import BaseDatabaseCreation
 
+import gevent
+import logging
+log = logging.getLogger('ldap.django')
 
 class DatabaseCreation(BaseDatabaseCreation):
     def create_test_db(self, *args, **kwargs):
@@ -65,7 +71,6 @@ class LdapDatabase(object):
     class OperationalError(
             DatabaseError,
             ldap.ADMINLIMIT_EXCEEDED,
-            ldap.AUTH_METHOD_NOT_SUPPORTED,
             ldap.AUTH_UNKNOWN,
             ldap.BUSY,
             ldap.CONFIDENTIALITY_REQUIRED,
@@ -180,14 +185,25 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         self.ops = DatabaseOperations(self)
         self.settings_dict['SUPPORTS_TRANSACTIONS'] = True
         self.autocommit = True
+        self.pool = self.settings_dict.get('POOL', None)
 
     def close(self):
         if hasattr(self, 'validate_thread_sharing'):
             # django >= 1.4
             self.validate_thread_sharing()
         if self.connection is not None:
-            self.connection.unbind_s()
-            self.connection = None
+            if self.pool:
+                grn = gevent.getcurrent()
+                try:
+                    name = grn._run.__name__ if not hasattr(grn._run, 'f') else grn._run.f.__name__
+                except AttributeError:
+                    name = "-"
+                log.info("--RELEASE-- {} {}".format(hex(id(grn)), name))
+                self.connection.release()
+                self.connection = None
+            else:
+                self.connection.unbind_s() 
+                self.connection = None
 
     def get_connection_params(self):
         """Compute appropriate parameters for establishing a new connection.
@@ -204,19 +220,29 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
     def get_new_connection(self, conn_params):
         """Build a connection from its parameters."""
-        connection = ldap.initialize(conn_params['uri'], bytes_mode=False)
+        if self.pool:
+            grn = gevent.getcurrent()
+            try:
+                name = grn._run.__name__ if not hasattr(grn._run, 'f') else grn._run.f.__name__
+            except AttributeError:
+                name = "-"
+            log.info("+++LEASE+++ {} {}".format(hex(id(grn)), name))
+            connection = self.pool.connection()
+        else:
+            connection = ldap.initialize(conn_params['uri'])
+            
+            options = conn_params['options']
+            for opt, value in options.items():
+                connection.set_option(opt, value)
 
-        options = conn_params['options']
-        for opt, value in options.items():
-            connection.set_option(opt, value)
+            if conn_params['tls']:
+                connection.start_tls_s()
 
-        if conn_params['tls']:
-            connection.start_tls_s()
-
-        connection.simple_bind_s(
-            conn_params['bind_dn'],
-            conn_params['bind_pw'],
-        )
+            log.critical("connection {} {} {}".format(conn_params['uri'], conn_params['bind_dn'], conn_params['bind_pw']))
+            connection.simple_bind_s(
+                conn_params['bind_dn'],
+                conn_params['bind_pw'],
+            )
         return connection
 
     def init_connection_state(self):
@@ -238,27 +264,63 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
     def add_s(self, dn, modlist):
         cursor = self._cursor()
-        return cursor.connection.add_s(dn, modlist)
+        try:
+            return cursor.connection.add_s(dn.encode(self.charset), modlist)
+        finally:
+            if self.pool:
+                self.close()
 
     def delete_s(self, dn):
         cursor = self._cursor()
-        return cursor.connection.delete_s(dn)
+        try:
+            return cursor.connection.delete_s(dn.encode(self.charset))
+        finally:
+            if self.pool:
+                self.close()
 
     def modify_s(self, dn, modlist):
         cursor = self._cursor()
-        return cursor.connection.modify_s(dn, modlist)
+        try:
+            return cursor.connection.modify_s(dn.encode(self.charset), modlist)
+        finally:
+            if self.pool:
+                self.close()
+
 
     def rename_s(self, dn, newrdn):
         cursor = self._cursor()
-        return cursor.connection.rename_s(dn, newrdn)
+        try:
+            return cursor.connection.rename_s(dn.encode(self.charset), newrdn.encode(self.charset))
+        finally:
+            if self.pool:
+                self.close()
 
+    def search_s(self, base, scope, filterstr='(objectClass=*)', attrlist=None):
+        cursor = self._cursor()
+        try:
+            _attrlist = [str(a) for a in attrlist] if attrlist else attrlist
+            if filterstr:
+                results = cursor.connection.search_s(base, scope, filterstr, _attrlist)
+            else:
+                results = cursor.connection.search_s(base, ldap.SCOPE_BASE, attrlist=_attrlist)
+            output = []
+            for dn, attrs in results:
+                output.append((dn.decode(self.charset), attrs))
+            return output
+        finally:
+            if self.pool:
+                self.close()
+
+    """
     def search_s(self, base, scope, filterstr='(objectClass=*)',
                  attrlist=None):
         cursor = self._cursor()
-        results = cursor.connection.search_s(base, scope, filterstr, attrlist)
+        _attrlist = [str(a) for a in attrlist] if attrlist else attrlist
+        results = cursor.connection.search_s(base, scope, filterstr, _attrlist)
         output = []
         for dn, attrs in results:
             # skip referrals
             if dn is not None:
                 output.append((dn, attrs))
         return output
+    """
